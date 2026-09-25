@@ -4,15 +4,20 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version, for example 1.0.0"
+        description: "Release version, for example 1.0.2"
         required: true
         type: string
+
   push:
     tags:
       - "pkg*"
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-ios-libbox-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -23,81 +28,175 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Physical iPhone/iPad
+          # Physical iPhone / iPad
           - name: ios-device-arm64
             platform: ios/arm64
             archive: Libbox-ios-device-arm64.zip
 
-          # Apple Silicon simulator
+          # Apple Silicon Mac simulator
           - name: ios-simulator-arm64
             platform: iossimulator/arm64
             archive: Libbox-ios-simulator-arm64.zip
 
-          # Intel simulator
+          # Intel Mac simulator
           - name: ios-simulator-amd64
             platform: iossimulator/amd64
             archive: Libbox-ios-simulator-amd64.zip
 
     steps:
-      - name: Checkout sing-box
+      - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          cache: true
 
-      - name: Patch Go for iOS
-        if: startsWith(matrix.platform, 'ios/')
+      - name: Show tool versions
         run: |
-          if [ -f .github/patch_go_for_ios.sh ]; then
-            bash .github/patch_go_for_ios.sh
+          set -euxo pipefail
+          go version
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Patch Go for Apple platforms
+        run: |
+          set -euxo pipefail
+
+          if [ -f ".github/patch_go_for_ios.sh" ]; then
+            bash ".github/patch_go_for_ios.sh"
+          else
+            echo "No Go patch script found, skipping."
           fi
 
-      - name: Install gomobile
+      - name: Install gomobile and gobind
         run: |
+          set -euxo pipefail
+
           go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
           go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
-          export PATH="$(go env GOPATH)/bin:$PATH"
-          gomobile init
+
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+          "$(go env GOPATH)/bin/gomobile" version || true
+          "$(go env GOPATH)/bin/gomobile" init
 
       - name: Build Libbox.xcframework
         run: |
           set -euxo pipefail
 
-          export PATH="$(go env GOPATH)/bin:$PATH"
-
           go run ./cmd/internal/build_libbox \
             -target apple \
             -platform "${{ matrix.platform }}"
 
-          test -d Libbox.xcframework
+          test -d "Libbox.xcframework"
+
+      - name: Verify framework
+        run: |
+          set -euxo pipefail
+
+          echo "Framework contents:"
+          find "Libbox.xcframework" -maxdepth 3 -type f | sort | head -100
+
+          echo
+          echo "Framework metadata:"
+          if [ -f "Libbox.xcframework/Info.plist" ]; then
+            plutil -p "Libbox.xcframework/Info.plist"
+          fi
 
       - name: Package framework
         run: |
           set -euxo pipefail
 
-          mkdir -p dist/${{ matrix.name }}
+          PACKAGE_DIR="dist/${{ matrix.name }}"
+          mkdir -p "$PACKAGE_DIR"
 
-          cp -R Libbox.xcframework dist/${{ matrix.name }}/
-          cp LICENSE dist/${{ matrix.name }}/
+          cp -R "Libbox.xcframework" "$PACKAGE_DIR/"
+          cp "LICENSE" "$PACKAGE_DIR/"
+
+          cat > "$PACKAGE_DIR/BUILD-INFO.txt" <<EOF
+          Repository: $GITHUB_REPOSITORY
+          Commit: $GITHUB_SHA
+          Platform: ${{ matrix.platform }}
+          Build name: ${{ matrix.name }}
+          Built at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          EOF
 
           cd dist
           zip -r "../${{ matrix.archive }}" "${{ matrix.name }}"
 
-      - name: Upload workflow artifact
+          test -f "../${{ matrix.archive }}"
+          ls -lh "../${{ matrix.archive }}"
+
+      - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.archive }}
+          if-no-files-found: error
+          compression-level: 0
 
-      - name: Upload GitHub Release asset
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+  release:
+    name: Upload packages to GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Calculate release tag
+        id: release
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          else
+            TAG_NAME="pkg${{ inputs.version }}"
+          fi
+
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG_NAME"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ios-*
+          path: dist
+          merge-multiple: true
+
+      - name: Show downloaded files
+        run: |
+          set -euxo pipefail
+          find dist -maxdepth 2 -type f -print
+          ls -lh dist/*.zip
+
+      - name: Upload files to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
-          files: ${{ matrix.archive }}
-          draft: false
+          tag_name: ${{ steps.release.outputs.tag_name }}
+          name: iOS Libbox ${{ steps.release.outputs.tag_name }}
+          body: |
+            ## iOS Libbox
+
+            This release contains sing-box Libbox frameworks for:
+
+            - iOS physical devices: `ios/arm64`
+            - Apple Silicon simulator: `iossimulator/arm64`
+            - Intel simulator: `iossimulator/amd64`
+
+            Build commit:
+
+            `${{ github.sha }}`
+
+            These packages contain `Libbox.xcframework` and the corresponding license file.
+          files: |
+            dist/*.zip
+          fail_on_unmatched_files: true
           prerelease: true
+          draft: false
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
