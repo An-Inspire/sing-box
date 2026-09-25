@@ -1,0 +1,103 @@
+name: Build iOS Libbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 1.0.0"
+        required: true
+        type: string
+  push:
+    tags:
+      - "pkg*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: macos-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Physical iPhone/iPad
+          - name: ios-device-arm64
+            platform: ios/arm64
+            archive: Libbox-ios-device-arm64.zip
+
+          # Apple Silicon simulator
+          - name: ios-simulator-arm64
+            platform: iossimulator/arm64
+            archive: Libbox-ios-simulator-arm64.zip
+
+          # Intel simulator
+          - name: ios-simulator-amd64
+            platform: iossimulator/amd64
+            archive: Libbox-ios-simulator-amd64.zip
+
+    steps:
+      - name: Checkout sing-box
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Patch Go for iOS
+        if: startsWith(matrix.platform, 'ios/')
+        run: |
+          if [ -f .github/patch_go_for_ios.sh ]; then
+            bash .github/patch_go_for_ios.sh
+          fi
+
+      - name: Install gomobile
+        run: |
+          go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+
+      - name: Build Libbox.xcframework
+        run: |
+          set -euxo pipefail
+
+          export PATH="$(go env GOPATH)/bin:$PATH"
+
+          go run ./cmd/internal/build_libbox \
+            -target apple \
+            -platform "${{ matrix.platform }}"
+
+          test -d Libbox.xcframework
+
+      - name: Package framework
+        run: |
+          set -euxo pipefail
+
+          mkdir -p dist/${{ matrix.name }}
+
+          cp -R Libbox.xcframework dist/${{ matrix.name }}/
+          cp LICENSE dist/${{ matrix.name }}/
+
+          cd dist
+          zip -r "../${{ matrix.archive }}" "${{ matrix.name }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.archive }}
+
+      - name: Upload GitHub Release asset
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', inputs.version) }}
+          files: ${{ matrix.archive }}
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
